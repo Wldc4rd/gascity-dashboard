@@ -1,8 +1,9 @@
-import type { GcBead, GcSession } from 'gas-city-dashboard-shared';
+import type { GcSession } from 'gas-city-dashboard-shared';
 import { resolveSessionForTarget } from 'gas-city-dashboard-shared';
 import { useState } from 'react';
 import { useBeadDetail } from '../../hooks/useBeadDetail';
 import { useEntityLinks } from '../../hooks/useEntityLinks';
+import type { SupervisorBead } from '../../supervisor/beadReads';
 import { BeadBody } from '../BeadBody';
 import { Button } from '../Button';
 import { RelatedEntities } from '../RelatedEntities';
@@ -21,7 +22,7 @@ interface BeadDetailRailProps {
   /** Cached row for `beadId`, when it is inside the board's window. A
    *  re-centred related bead may be outside it, in which case this is null
    *  and the detail is fetched by id. */
-  initialBead: GcBead | null;
+  initialBead: SupervisorBead | null;
   /** Session list, for assignee → live-run resolution. */
   sessions: readonly GcSession[];
   /** Re-centre the board on a related bead. */
@@ -69,7 +70,7 @@ export function BeadDetailRail({
           {' · '}
           {shown.issue_type}
           {' · P'}
-          {shown.priority === null ? '—' : shown.priority}
+          {shown.priority == null ? '—' : shown.priority}
         </p>
         {liveRunnable && (
           <div className="mt-3">

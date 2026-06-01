@@ -1,4 +1,5 @@
 import type { RunLane, RunSummary, SourceState } from "gas-city-dashboard-shared";
+import type { AttentionSeverity } from "../../attention/compose";
 import { LaneCard } from "./LaneCard";
 
 // Run phase-lane map (gascity-dashboard-0t6). Renders the snapshot's
@@ -17,6 +18,7 @@ interface RunMapProps {
   source: SourceState<RunSummary>;
   now: number;
   showHistory: boolean;
+  attentionSeverity?: (lane: RunLane) => AttentionSeverity | null;
 }
 
 const COUNT_LABELS: Array<[keyof RunSummary["runCounts"], string]> = [
@@ -28,7 +30,12 @@ const COUNT_LABELS: Array<[keyof RunSummary["runCounts"], string]> = [
 
 const HISTORICAL_SECTION_ID = 'runs-historical-section';
 
-export function RunMap({ source, now, showHistory }: RunMapProps) {
+export function RunMap({
+  source,
+  now,
+  showHistory,
+  attentionSeverity,
+}: RunMapProps) {
   if (source.status === "error") {
     return (
       <section>
@@ -45,15 +52,31 @@ export function RunMap({ source, now, showHistory }: RunMapProps) {
   return (
     <section>
       <CountsHeader summary={summary} />
-      <ActiveSection summary={summary} now={now} />
+      <ActiveSection
+        summary={summary}
+        now={now}
+        {...(attentionSeverity === undefined ? {} : { attentionSeverity })}
+      />
       {showHistory && (
-        <HistoricalSection summary={summary} now={now} />
+        <HistoricalSection
+          summary={summary}
+          now={now}
+          {...(attentionSeverity === undefined ? {} : { attentionSeverity })}
+        />
       )}
     </section>
   );
 }
 
-function ActiveSection({ summary, now }: { summary: RunSummary; now: number }) {
+function ActiveSection({
+  summary,
+  now,
+  attentionSeverity,
+}: {
+  summary: RunSummary;
+  now: number;
+  attentionSeverity?: (lane: RunLane) => AttentionSeverity | null;
+}) {
   if (summary.lanes.length === 0) {
     // Distinguish "nothing at all" from "nothing active but N completed".
     const trailer =
@@ -81,7 +104,14 @@ function ActiveSection({ summary, now }: { summary: RunSummary; now: number }) {
           </h3>
           <ol className="mt-3 divide-y divide-rule">
             {lanes.map((lane) => (
-              <LaneCard key={lane.id} lane={lane} now={now} />
+              <LaneCard
+                key={lane.id}
+                lane={lane}
+                now={now}
+                {...(attentionSeverity === undefined
+                  ? {}
+                  : { attentionSeverity: attentionSeverity(lane) })}
+              />
             ))}
           </ol>
         </div>
@@ -121,7 +151,15 @@ function rigLabel(rig: string): string {
   return rig.replace(/^rig:/, '');
 }
 
-function HistoricalSection({ summary, now }: { summary: RunSummary; now: number }) {
+function HistoricalSection({
+  summary,
+  now,
+  attentionSeverity,
+}: {
+  summary: RunSummary;
+  now: number;
+  attentionSeverity?: (lane: RunLane) => AttentionSeverity | null;
+}) {
   return (
     <section
       id={HISTORICAL_SECTION_ID}
@@ -139,7 +177,14 @@ function HistoricalSection({ summary, now }: { summary: RunSummary; now: number 
         <>
           <ol className="mt-3 divide-y divide-rule">
             {summary.historicalLanes.map((lane) => (
-              <LaneCard key={lane.id} lane={lane} now={now} />
+              <LaneCard
+                key={lane.id}
+                lane={lane}
+                now={now}
+                {...(attentionSeverity === undefined
+                  ? {}
+                  : { attentionSeverity: attentionSeverity(lane) })}
+              />
             ))}
           </ol>
           {summary.totalHistorical > summary.historicalLanes.length && (

@@ -1,6 +1,6 @@
-import type { GcBead } from "gas-city-dashboard-shared";
 import { useBeadDetail } from "../hooks/useBeadDetail";
 import { useEntityLinks } from "../hooks/useEntityLinks";
+import type { SupervisorBead } from "../supervisor/beadReads";
 import { BeadBody } from "./BeadBody";
 import { Modal } from "./Modal";
 import { RelatedEntities } from "./RelatedEntities";
@@ -10,16 +10,17 @@ import { RelatedEntities } from "./RelatedEntities";
 // mutations (claim/close/nudge) live on the Beads page row actions
 // and are deliberately not duplicated here.
 //
-// Fetches /api/beads/:id on open. If the caller already has the full
-// bead in state (Beads, AgentDetail), it can pass it via `initialBead`
-// so the modal renders immediately and skips the network round trip.
+// Fetches direct supervisor bead detail on open. If the caller already has
+// the full bead in state (Beads, AgentDetail), it can pass it via
+// `initialBead` so the modal renders immediately and skips the network round
+// trip.
 
 interface BeadDetailModalProps {
   open: boolean;
   onClose: () => void;
   beadId: string | null;
   /** Optional pre-loaded bead. When present and complete, skips the fetch. */
-  initialBead?: GcBead | null;
+  initialBead?: SupervisorBead | null;
   /**
    * Re-center the modal on a related bead (gascity-dashboard-j4x). When
    * omitted, related bead rows render as plain text (no in-place
@@ -50,7 +51,7 @@ export function BeadDetailModal({
             {" · "}
             {bead.issue_type}
             {" · P"}
-            {bead.priority === null ? "—" : bead.priority}
+            {bead.priority == null ? "—" : bead.priority}
           </span>
         ) : beadId ? (
           <code className="text-fg-muted">{beadId}</code>

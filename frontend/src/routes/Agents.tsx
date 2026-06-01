@@ -1,12 +1,15 @@
-import { useMemo, useState } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
 import {
   GC_EVENT_PREFIX,
   effectiveContextPct,
-  type GcAgent,
 } from 'gas-city-dashboard-shared';
-import { api } from '../api/client';
 import { Button } from '../components/Button';
+import { useAttentionModel } from '../attention/context';
+import {
+  attentionRowProps,
+  resourceAttentionSeverity,
+} from '../attention/routeHighlight';
 import { FilterChips } from '../components/FilterChips';
 import { GroupedTable } from '../components/GroupedTable';
 import { ListSearchBar } from '../components/ListSearchBar';
@@ -24,6 +27,17 @@ import { useGcEventRefresh } from '../hooks/useGcEvents';
 import { useListFilters, type FilterChip, type SortMode } from '../hooks/useListFilters';
 import { formatRelative } from '../hooks/time';
 import {
+  attachCommand,
+  listAgentPendingInteractions,
+  respondToAgentPendingInteraction,
+  type AgentPendingInteraction,
+} from '../supervisor/agentPending';
+import { listSupervisorSessions } from '../supervisor/sessionReads';
+import {
+  listSupervisorAgents,
+  type SupervisorAgent,
+} from '../supervisor/agentReads';
+import {
   ORCHESTRATION_PROJECT,
   agentProject,
   isPerRigDispatcherAgent,
@@ -31,9 +45,9 @@ import {
 import { agentSlug } from '../hooks/sessionSlug';
 
 // gascity-dashboard-ay6: the Agents view consumes the supervisor's
-// first-class /v0/city/{name}/agents roster (via /api/agents). The
-// previous implementation derived agents from /api/sessions, which
-// undercounted any agent that wasn't currently running a session
+// first-class /v0/city/{name}/agents roster. The previous implementation
+// derived agents from the dashboard sessions mirror, which undercounted
+// any agent that wasn't currently running a session
 // (orphan / configured-but-asleep agents simply didn't appear).
 //
 // The cityStatus snapshot collector continues to aggregate over sessions
@@ -46,7 +60,7 @@ const NON_COLLAPSIBLE_PROJECTS = new Set([ORCHESTRATION_PROJECT]);
 // with no session (orphans) return undefined so the list-filter sink sends
 // them to the bottom under activity-sort rather than ranking them at the
 // epoch.
-function agentActivity(a: GcAgent): number | undefined {
+function agentActivity(a: SupervisorAgent): number | undefined {
   const raw = a.session?.last_activity;
   if (!raw) return undefined;
   const t = Date.parse(raw);
@@ -72,7 +86,7 @@ const SORT_OPTIONS: ReadonlyArray<{ id: SortMode; label: string }> = [
 // to running/detached/stopped (a suspended agent that also reads as
 // running/detached/stopped via raw state should still only count as
 // suspended).
-export const AGENT_CHIPS: ReadonlyArray<FilterChip<GcAgent>> = [
+export const AGENT_CHIPS: ReadonlyArray<FilterChip<SupervisorAgent>> = [
   {
     id: 'running',
     label: 'running',
@@ -112,7 +126,7 @@ export const AGENT_CHIPS: ReadonlyArray<FilterChip<GcAgent>> = [
   },
 ];
 
-const AGENT_SEARCH_FIELDS = (a: GcAgent): ReadonlyArray<string | undefined> => [
+const AGENT_SEARCH_FIELDS = (a: SupervisorAgent): ReadonlyArray<string | undefined> => [
   a.name,
   a.display_name,
   a.pool,
@@ -122,17 +136,30 @@ const AGENT_SEARCH_FIELDS = (a: GcAgent): ReadonlyArray<string | undefined> => [
 ];
 
 export function AgentsPage() {
+  const attention = useAttentionModel();
   const { data, loading, error, refresh } = useCachedData(
     'agents',
-    () => api.listAgents(),
+    listSupervisorAgents,
   );
   // The supervisor's AgentResponse.session (SessionInfo) carries only
   // `name`/`attached`/`last_activity` — NOT the session id. Peek needs
   // the session id (gc-XXX format) per SESSION_ID_RE on the backend.
   // Fetch the sessions list in parallel so we can map agent.session.name
   // -> session.id at peek time.
-  const sessionsCache = useCachedData('sessions', () => api.listSessions());
-  const rows = useMemo<GcAgent[]>(() => data?.items ?? [], [data]);
+  const sessionsCache = useCachedData('sessions', listSupervisorSessions);
+  const rows = useMemo<SupervisorAgent[]>(() => data?.items ?? [], [data]);
+  const sessionIds = useMemo(
+    () => (sessionsCache.data?.items ?? []).map((session) => session.id).sort(),
+    [sessionsCache.data],
+  );
+  const agentNames = useMemo(
+    () => rows.map((agent) => agent.name).sort(),
+    [rows],
+  );
+  const pendingCache = useCachedData(
+    `agent-pending:${agentNames.join(',')}:${sessionIds.join(',')}`,
+    () => listAgentPendingInteractions(rows, sessionsCache.data?.items ?? []),
+  );
   const sessionsById = useMemo(() => {
     const map = new Map<string, string>();
     for (const s of sessionsCache.data?.items ?? []) {
@@ -140,11 +167,24 @@ export function AgentsPage() {
     }
     return map;
   }, [sessionsCache.data]);
+  const pendingByAgent = useMemo(() => {
+    const map = new Map<string, AgentPendingInteraction>();
+    for (const pending of pendingCache.data ?? []) {
+      map.set(pending.agentName, pending);
+    }
+    return map;
+  }, [pendingCache.data]);
   const now = useNow();
 
   // Peek key is the agent alias (`name`); modal resolves the live session
   // by mapping agent.session.name -> session.id via the sessions cache.
   const [peekAlias, setPeekAlias] = useState<string | null>(null);
+  const [responseMessage, setResponseMessage] = useState<string | null>(null);
+  const [responseError, setResponseError] = useState<string | null>(null);
+  const [responding, setResponding] = useState<{
+    sessionId: string;
+    action: string;
+  } | null>(null);
   const peekAgent = useMemo(
     () => (peekAlias === null ? null : rows.find((a) => a.name === peekAlias) ?? null),
     [rows, peekAlias],
@@ -158,8 +198,28 @@ export function AgentsPage() {
   const sseState = useGcEventRefresh([GC_EVENT_PREFIX.session, 'agent.'], () => void refresh());
 
   const synopsis = useMemo(() => buildAgentSynopsis(rows), [rows]);
+  const handlePendingResponse = useCallback(async (
+    pending: AgentPendingInteraction,
+    action: 'approve' | 'deny',
+  ) => {
+    setResponding({ sessionId: pending.sessionId, action });
+    setResponseMessage(null);
+    setResponseError(null);
+    try {
+      await respondToAgentPendingInteraction(pending.sessionId, {
+        action,
+        request_id: pending.pending.request_id,
+      });
+      setResponseMessage(`responded to ${pending.agentName}`);
+      await pendingCache.refresh();
+    } catch (err) {
+      setResponseError(err instanceof Error ? err.message : 'response failed');
+    } finally {
+      setResponding(null);
+    }
+  }, [pendingCache]);
 
-  const filters = useListFilters<GcAgent>({
+  const filters = useListFilters<SupervisorAgent>({
     viewKey: 'agents',
     rows,
     projectOf: agentProject,
@@ -171,8 +231,13 @@ export function AgentsPage() {
     pinnedProjects: PINNED_PROJECTS,
     nonCollapsibleProjects: NON_COLLAPSIBLE_PROJECTS,
   });
+  const rowProps = useMemo(
+    () => (agent: SupervisorAgent) =>
+      attentionRowProps(resourceAttentionSeverity(attention, 'agents', agent.name)),
+    [attention],
+  );
 
-  const columns = useMemo<ReadonlyArray<TableColumn<GcAgent>>>(() => [
+  const columns = useMemo<ReadonlyArray<TableColumn<SupervisorAgent>>>(() => [
     {
       key: 'name',
       label: 'Agent',
@@ -249,11 +314,24 @@ export function AgentsPage() {
       label: 'Activity',
       sortable: true,
       sortValue: (r) => r.activity ?? '',
-      render: (r) => (
-        <span className="text-fg-muted">
-          {r.activity ?? (r.running ? 'running' : '·')}
-        </span>
-      ),
+      render: (r) => {
+        const pending = pendingByAgent.get(r.name);
+        if (pending !== undefined) {
+          return (
+            <div className="min-w-0">
+              <StatusBadge tone="stuck" label="needs you" />
+              <p className="mt-1 truncate text-fg-muted" title={pending.pending.prompt}>
+                {pending.pending.prompt ?? pending.pending.kind}
+              </p>
+            </div>
+          );
+        }
+        return (
+          <span className="text-fg-muted">
+            {r.activity ?? (r.running ? 'running' : '·')}
+          </span>
+        );
+      },
       className: 'w-28',
     },
     {
@@ -318,16 +396,44 @@ export function AgentsPage() {
         // transcript fetch. Use visibility:hidden equivalent (render the
         // empty cell) rather than collapsing the column width.
         if (!r.session) return null;
+        const pending = pendingByAgent.get(r.name);
         return (
-          <Button size="sm" tone="quiet" onClick={() => setPeekAlias(r.name)}>
-            Peek
-          </Button>
+          <div className="flex justify-end gap-2">
+            {pending !== undefined && (
+              <>
+                <Button
+                  size="sm"
+                  tone="quiet"
+                  disabled={responding?.sessionId === pending.sessionId}
+                  onClick={() => void handlePendingResponse(pending, 'approve')}
+                >
+                  {responding?.sessionId === pending.sessionId && responding.action === 'approve'
+                    ? 'Approving'
+                    : 'Approve'}
+                </Button>
+                <Button
+                  size="sm"
+                  tone="quiet"
+                  disabled={responding?.sessionId === pending.sessionId}
+                  onClick={() => void handlePendingResponse(pending, 'deny')}
+                >
+                  {responding?.sessionId === pending.sessionId && responding.action === 'deny'
+                    ? 'Denying'
+                    : 'Deny'}
+                </Button>
+                <CopyAttachButton command={attachCommand(r.name)} />
+              </>
+            )}
+            <Button size="sm" tone="quiet" onClick={() => setPeekAlias(r.name)}>
+              Peek
+            </Button>
+          </div>
         );
       },
       align: 'right',
-      className: 'w-20',
+      className: 'w-80',
     },
-  ], [now]);
+  ], [handlePendingResponse, now, pendingByAgent, responding]);
 
   return (
     <section>
@@ -378,12 +484,23 @@ export function AgentsPage() {
           />
         </div>
       </div>
+      {responseMessage && (
+        <div className="mb-4 text-body text-fg-muted" role="status">
+          {responseMessage}
+        </div>
+      )}
+      {responseError && (
+        <div className="mb-4 text-body text-accent" role="alert">
+          {responseError}
+        </div>
+      )}
 
       <GroupedTable
         groups={filters.groups}
         columns={columns}
         rowKey={(r) => r.name}
         onToggleProject={filters.toggleProject}
+        rowProps={rowProps}
         emptyMessage={
           filters.search.length > 0 || filters.activeChipIds.size > 0
             ? 'No agents match the current search or filter.'
@@ -425,6 +542,40 @@ export function AgentsPage() {
   );
 }
 
+function CopyAttachButton({ command }: { command: string }) {
+  const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle');
+  const label = state === 'copied'
+    ? 'Copied'
+    : state === 'failed'
+      ? 'Copy failed'
+      : 'Copy attach';
+
+  return (
+    <Button
+      size="sm"
+      tone="quiet"
+      title={command}
+      onClick={() => {
+        void copyAttachCommand(command, setState);
+      }}
+    >
+      {label}
+    </Button>
+  );
+}
+
+async function copyAttachCommand(
+  command: string,
+  setState: (state: 'idle' | 'copied' | 'failed') => void,
+): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(command);
+    setState('copied');
+  } catch {
+    setState('failed');
+  }
+}
+
 // Single source of truth for state → tone mapping. Aligned with how the
 // gc supervisor emits agent (and session) states. Unknown states default
 // to neutral so we don't lie about them. 'detached' is explicit (not a
@@ -463,7 +614,7 @@ export type SynopsisBucket =
   | 'stuck'
   | 'suspended';
 
-function stateBucket(agent: GcAgent): SynopsisBucket {
+function stateBucket(agent: SupervisorAgent): SynopsisBucket {
   if (agent.suspended) return 'suspended';
   switch (agent.state) {
     case 'active':
@@ -485,7 +636,7 @@ function stateBucket(agent: GcAgent): SynopsisBucket {
   }
 }
 
-export function buildAgentSynopsis(rows: ReadonlyArray<GcAgent>): string {
+export function buildAgentSynopsis(rows: ReadonlyArray<SupervisorAgent>): string {
   if (rows.length === 0) return 'No agents configured.';
   const counts = new Map<SynopsisBucket, number>();
   for (const r of rows) {

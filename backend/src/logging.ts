@@ -14,7 +14,6 @@ export const LOG_COMPONENT = {
   health: 'health',
   links: 'links',
   mail: 'mail',
-  mailSend: 'mail-send',
   maintainer: 'maintainer',
   sessions: 'sessions',
   snapshot: 'snapshot',

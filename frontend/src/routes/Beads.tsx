@@ -1,6 +1,11 @@
 import { useCallback, useMemo, useState } from 'react';
-import { GC_EVENT_PREFIX, type GcBead } from 'gas-city-dashboard-shared';
-import { api, formatApiError } from '../api/client';
+import { GC_EVENT_PREFIX } from 'gas-city-dashboard-shared';
+import { formatApiError } from '../api/client';
+import { useAttentionModel } from '../attention/context';
+import {
+  attentionRowProps,
+  resourceAttentionSeverity,
+} from '../attention/routeHighlight';
 import { BeadBoardSection } from '../components/beads/BeadBoardSection';
 import { BeadDetailRail } from '../components/beads/BeadDetailRail';
 import { BeadDetailModal } from '../components/BeadDetailModal';
@@ -19,6 +24,18 @@ import { useGcEventRefresh } from '../hooks/useGcEvents';
 import { useListFilters, type FilterChip } from '../hooks/useListFilters';
 import { beadProject } from '../hooks/projectOf';
 import { formatDate } from '../lib/format';
+import {
+  listSupervisorBeads,
+  type SupervisorBead,
+} from '../supervisor/beadReads';
+import { listSupervisorAgents } from '../supervisor/agentReads';
+import {
+  claimSupervisorBead,
+  closeSupervisorBead,
+  createAndSlingSupervisorBead,
+  nudgeSupervisorAgent,
+} from '../supervisor/beadWrites';
+import { listSupervisorSessions } from '../supervisor/sessionReads';
 
 type BeadView = 'board' | 'list';
 
@@ -29,14 +46,14 @@ const VIEW_OPTIONS: ReadonlyArray<{ id: BeadView; label: string }> = [
 
 const EMPTY_IDS: ReadonlySet<string> = new Set();
 
-const BEAD_CHIPS: ReadonlyArray<FilterChip<GcBead>> = [
+const BEAD_CHIPS: ReadonlyArray<FilterChip<SupervisorBead>> = [
   { id: 'open', label: 'open', match: (b) => b.status === 'open' },
   { id: 'in_progress', label: 'in progress', match: (b) => b.status === 'in_progress' },
   { id: 'blocked', label: 'blocked', match: (b) => b.status === 'blocked' },
   { id: 'closed', label: 'closed', match: (b) => b.status === 'closed' },
 ];
 
-const BEAD_SEARCH_FIELDS = (b: GcBead): ReadonlyArray<string | undefined> => [
+const BEAD_SEARCH_FIELDS = (b: SupervisorBead): ReadonlyArray<string | undefined> => [
   b.id,
   b.title,
   b.assignee,
@@ -44,7 +61,9 @@ const BEAD_SEARCH_FIELDS = (b: GcBead): ReadonlyArray<string | undefined> => [
 ];
 
 export function BeadsPage() {
+  const attention = useAttentionModel();
   const [labelFilter, setLabelFilter] = useState<string | null>(null);
+  const [rigFilter, setRigFilter] = useState('');
   const [showAll, setShowAll] = useState(false);
   const [view, setView] = useState<BeadView>('board');
   // The board is a kanban: its in-progress / blocked / done columns are
@@ -52,8 +71,8 @@ export function BeadsPage() {
   // keeps the manual toggle.
   const showAllEffective = view === 'board' || showAll;
   const { data, loading, error, refresh } = useCachedData(
-    showAllEffective ? 'beads:all' : 'beads:open',
-    () => api.listBeads(showAllEffective),
+    `${showAllEffective ? 'beads:all' : 'beads:open'}:rig:${rigFilter}`,
+    () => listSupervisorBeads(showAllEffective, rigFilter),
   );
   const rows = useMemo(() => data?.items ?? [], [data]);
   const totalShown = data?.total ?? 0;
@@ -61,19 +80,43 @@ export function BeadsPage() {
   const upstreamFetched = data?.upstream_fetched;
   const fetchLimit = data?.fetch_limit;
 
-  const [closing, setClosing] = useState<GcBead | null>(null);
+  const [closing, setClosing] = useState<SupervisorBead | null>(null);
   const [closeReason, setCloseReason] = useState('');
   const [actionInFlight, setActionInFlight] = useState<{ id: string; action: string } | null>(null);
   const [actionResult, setActionResult] = useState<string | null>(null);
-  const [viewing, setViewing] = useState<GcBead | null>(null);
+  const [viewing, setViewing] = useState<SupervisorBead | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+  const [createInFlight, setCreateInFlight] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const [newTitle, setNewTitle] = useState('');
+  const [newBody, setNewBody] = useState('');
+  const [newRig, setNewRig] = useState('');
+  const [newAgent, setNewAgent] = useState('');
 
   // Sessions back the board's bead -> live-run resolution. Only the board
   // view reads them; the list view leaves the cache cold.
-  const sessions = useCachedData('sessions', () => api.listSessions());
+  const sessions = useCachedData('sessions', listSupervisorSessions);
   const sessionItems = useMemo(
     () => sessions.data?.items ?? [],
     [sessions.data],
+  );
+  const agents = useCachedData('agents', listSupervisorAgents);
+  const agentItems = useMemo(
+    () => agents.data?.items ?? [],
+    [agents.data],
+  );
+  const rigOptions = useMemo(
+    () => Array.from(
+      new Set(agentItems.map((agent) => agent.rig).filter(isNonEmptyString)),
+    ).sort((a, b) => a.localeCompare(b)),
+    [agentItems],
+  );
+  const filteredAgents = useMemo(
+    () => newRig.length === 0
+      ? agentItems
+      : agentItems.filter((agent) => agent.rig === newRig),
+    [agentItems, newRig],
   );
 
   const filteredRows = useMemo(() => {
@@ -81,7 +124,7 @@ export function BeadsPage() {
     return rows.filter((r) => Array.isArray(r.labels) && r.labels.includes(labelFilter));
   }, [rows, labelFilter]);
 
-  const filters = useListFilters<GcBead>({
+  const filters = useListFilters<SupervisorBead>({
     viewKey: 'beads',
     rows: filteredRows,
     projectOf: beadProject,
@@ -100,6 +143,15 @@ export function BeadsPage() {
     [filters.groups],
   );
   const graph = useMemo(() => buildBeadGraph(matched), [matched]);
+  const beadAttentionSeverity = useCallback(
+    (beadId: string) => resourceAttentionSeverity(attention, 'beads', beadId),
+    [attention],
+  );
+  const rowProps = useMemo(
+    () => (bead: SupervisorBead) =>
+      attentionRowProps(beadAttentionSeverity(bead.id)),
+    [beadAttentionSeverity],
+  );
   // Bead ids per rig group, so each rig section renders its own slice of the
   // single shared graph (cross-rig edges stay resolved).
   const groupIds = useMemo(() => {
@@ -116,16 +168,20 @@ export function BeadsPage() {
 
   const runAction = useCallback(
     async (
-      bead: GcBead,
+      bead: SupervisorBead,
       action: 'claim' | 'close' | 'nudge',
       reason?: string,
     ): Promise<void> => {
       setActionInFlight({ id: bead.id, action });
       setActionResult(null);
       try {
-        if (action === 'claim') await api.claimBead(bead.id);
-        else if (action === 'close') await api.closeBead(bead.id, reason);
-        else await api.nudgeBead(bead.id);
+        if (action === 'claim') await claimSupervisorBead(bead.id);
+        else if (action === 'close') await closeSupervisorBead(bead.id, reason);
+        else {
+          const agentAlias = bead.assignee?.trim();
+          if (!agentAlias) throw new Error('no assignee to nudge');
+          await nudgeSupervisorAgent(agentAlias);
+        }
         setActionResult(`${action} ${bead.id}: ok`);
         await refresh();
       } catch (err) {
@@ -136,13 +192,64 @@ export function BeadsPage() {
     },
     [refresh],
   );
+  const openCreateBead = useCallback(() => {
+    const defaultRig = rigOptions[0] ?? '';
+    const defaultAgent = agentItems.find((agent) =>
+      defaultRig.length === 0 || agent.rig === defaultRig,
+    );
+    setNewTitle('');
+    setNewBody('');
+    setNewRig(defaultRig);
+    setNewAgent(defaultAgent?.name ?? '');
+    setCreateError(null);
+    setActionResult(null);
+    setCreating(true);
+  }, [agentItems, rigOptions]);
+  const handleRigChange = useCallback(
+    (rig: string) => {
+      setNewRig(rig);
+      if (
+        newAgent.length > 0 &&
+        !agentItems.some((agent) =>
+          agent.name === newAgent && (rig.length === 0 || agent.rig === rig),
+        )
+      ) {
+        setNewAgent('');
+      }
+    },
+    [agentItems, newAgent],
+  );
+  const createAndSling = useCallback(async (): Promise<void> => {
+    setCreateInFlight(true);
+    setCreateError(null);
+    setActionResult(null);
+    try {
+      const result = await createAndSlingSupervisorBead({
+        title: newTitle,
+        description: newBody,
+        rig: newRig,
+        target: newAgent,
+      });
+      setActionResult(`created and slung ${result.bead.id} to ${result.sling.target}`);
+      setCreating(false);
+      setNewTitle('');
+      setNewBody('');
+      setNewRig('');
+      setNewAgent('');
+      await refresh();
+    } catch (err) {
+      setCreateError(formatApiError(err, 'create and sling failed'));
+    } finally {
+      setCreateInFlight(false);
+    }
+  }, [newAgent, newBody, newRig, newTitle, refresh]);
 
   const synopsis = useMemo(
-    () => buildSynopsis(filteredRows, totalShown, labelFilter),
-    [filteredRows, totalShown, labelFilter],
+    () => buildSynopsis(filteredRows, totalShown, labelFilter, rigFilter),
+    [filteredRows, totalShown, labelFilter, rigFilter],
   );
 
-  const columns = useMemo<ReadonlyArray<TableColumn<GcBead>>>(() => [
+  const columns = useMemo<ReadonlyArray<TableColumn<SupervisorBead>>>(() => [
     {
       key: 'id',
       label: 'ID',
@@ -204,7 +311,7 @@ export function BeadsPage() {
       sortValue: (r) => r.priority ?? Number.POSITIVE_INFINITY,
       render: (r) => (
         <span className={`tnum font-medium ${priorityColor(r.priority)}`}>
-          {r.priority === null ? 'P—' : `P${r.priority}`}
+          {r.priority == null ? 'P—' : `P${r.priority}`}
         </span>
       ),
       align: 'right',
@@ -305,6 +412,9 @@ export function BeadsPage() {
             <Button size="sm" onClick={() => void refresh()} disabled={loading}>
               {loading ? 'Refreshing' : 'Refresh'}
             </Button>
+            <Button size="sm" onClick={openCreateBead}>
+              New bead
+            </Button>
           </>
         }
       />
@@ -330,6 +440,18 @@ export function BeadsPage() {
             </button>
           </p>
         )}
+        {rigFilter.length > 0 && (
+          <p>
+            Filtering by rig <span className="text-accent">{rigFilter}</span>.{' '}
+            <button
+              type="button"
+              onClick={() => setRigFilter('')}
+              className="text-fg-muted hover:text-fg focus-mark underline decoration-dotted underline-offset-2 rounded-sm"
+            >
+              Clear
+            </button>
+          </p>
+        )}
         {actionResult && <p className="italic">{actionResult}</p>}
       </div>
 
@@ -343,12 +465,30 @@ export function BeadsPage() {
           ariaLabel="Search beads"
         />
         <div className="flex items-baseline justify-between gap-4">
-          <FilterChips
-            chips={BEAD_CHIPS}
-            activeIds={filters.activeChipIds}
-            onToggle={filters.toggleChip}
-            legend="Status"
-          />
+          <div className="flex flex-wrap items-baseline gap-x-8 gap-y-3">
+            <FilterChips
+              chips={BEAD_CHIPS}
+              activeIds={filters.activeChipIds}
+              onToggle={filters.toggleChip}
+              legend="Status"
+            />
+            <label className="flex items-baseline gap-2 text-label uppercase tracking-wider text-fg-muted">
+              <span>Rig filter</span>
+              <select
+                aria-label="Rig filter"
+                value={rigFilter}
+                onChange={(e) => setRigFilter(e.target.value)}
+                className="bg-transparent border border-rule rounded-sm px-2 py-1 text-label uppercase tracking-wider text-fg-muted focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
+              >
+                <option value="">All rigs</option>
+                {rigOptions.map((rig) => (
+                  <option key={rig} value={rig}>
+                    {rig}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
           <SortToggle<BeadView>
             value={view}
             options={VIEW_OPTIONS}
@@ -378,6 +518,7 @@ export function BeadsPage() {
                   graph={graph}
                   ids={groupIds.get(g.projectKey) ?? EMPTY_IDS}
                   selectedId={selectedId}
+                  attentionSeverity={beadAttentionSeverity}
                   onSelect={setSelectedId}
                 />
               ))}
@@ -398,6 +539,7 @@ export function BeadsPage() {
           columns={columns}
           rowKey={(r) => r.id}
           onToggleProject={filters.toggleProject}
+          rowProps={rowProps}
           emptyMessage={
             filters.search.length > 0 || filters.activeChipIds.size > 0
               ? 'No beads match the current search or filter.'
@@ -416,6 +558,109 @@ export function BeadsPage() {
         beadId={viewing?.id ?? null}
         initialBead={viewing}
       />
+
+      <Modal
+        open={creating}
+        onClose={() => {
+          if (!createInFlight) setCreating(false);
+        }}
+        title="New bead"
+        widthClass="max-w-xl"
+        footer={
+          <>
+            <Button
+              tone="quiet"
+              size="sm"
+              disabled={createInFlight}
+              onClick={() => setCreating(false)}
+            >
+              Cancel
+            </Button>
+            <Button
+              tone="accent"
+              size="sm"
+              disabled={
+                createInFlight ||
+                newTitle.trim().length === 0 ||
+                newAgent.trim().length === 0
+              }
+              onClick={() => void createAndSling()}
+            >
+              {createInFlight ? 'Creating' : 'Create and sling'}
+            </Button>
+          </>
+        }
+      >
+        <div className="space-y-4">
+          {createError && (
+            <p className="text-accent" role="alert">
+              {createError}
+            </p>
+          )}
+          {agents.error && (
+            <p className="text-accent" role="alert">
+              {agents.error}
+            </p>
+          )}
+          <label className="block">
+            <span className="text-label uppercase tracking-wider text-fg-muted">
+              Title
+            </span>
+            <input
+              value={newTitle}
+              onChange={(e) => setNewTitle(e.target.value)}
+              className="mt-2 w-full bg-surface-tint border border-rule rounded-sm px-3 py-2 text-body text-fg placeholder:text-fg-faint focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
+            />
+          </label>
+          <label className="block">
+            <span className="text-label uppercase tracking-wider text-fg-muted">
+              Body
+            </span>
+            <textarea
+              value={newBody}
+              onChange={(e) => setNewBody(e.target.value)}
+              rows={5}
+              className="mt-2 w-full bg-surface-tint border border-rule rounded-sm px-3 py-2 text-body text-fg placeholder:text-fg-faint focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40 resize-y"
+            />
+          </label>
+          <div className="grid gap-4 sm:grid-cols-2">
+            <label className="block">
+              <span className="text-label uppercase tracking-wider text-fg-muted">
+                Rig
+              </span>
+              <select
+                value={newRig}
+                onChange={(e) => handleRigChange(e.target.value)}
+                className="mt-2 w-full bg-surface-tint border border-rule rounded-sm px-3 py-2 text-body text-fg focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
+              >
+                <option value="">Any rig</option>
+                {rigOptions.map((rig) => (
+                  <option key={rig} value={rig}>
+                    {rig}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="block">
+              <span className="text-label uppercase tracking-wider text-fg-muted">
+                Agent
+              </span>
+              <select
+                value={newAgent}
+                onChange={(e) => setNewAgent(e.target.value)}
+                className="mt-2 w-full bg-surface-tint border border-rule rounded-sm px-3 py-2 text-body text-fg focus:border-accent focus:outline-none focus:ring-1 focus:ring-accent/40"
+              >
+                <option value="">Choose agent</option>
+                {filteredAgents.map((agent) => (
+                  <option key={agent.name} value={agent.name}>
+                    {agent.display_name ?? agent.name}
+                  </option>
+                ))}
+              </select>
+            </label>
+          </div>
+        </div>
+      </Modal>
 
       <Modal
         open={closing !== null}
@@ -473,16 +718,26 @@ function labelTone(label: string): string {
   return 'text-fg-muted hover:text-fg';
 }
 
-function priorityColor(p: number | null): string {
+function priorityColor(p: number | null | undefined): string {
   if (p === 0) return 'text-accent';
   if (p === 1) return 'text-warn';
   return 'text-fg-muted';
 }
 
-function buildSynopsis(filtered: ReadonlyArray<GcBead>, totalShown: number, labelFilter: string | null): string {
+function isNonEmptyString(value: string | undefined): value is string {
+  return typeof value === 'string' && value.length > 0;
+}
+
+function buildSynopsis(
+  filtered: ReadonlyArray<SupervisorBead>,
+  totalShown: number,
+  labelFilter: string | null,
+  rigFilter: string,
+): string {
   if (labelFilter !== null) {
     return `${filtered.length} matching "${labelFilter}".`;
   }
+  if (rigFilter.length > 0 && filtered.length === 0) return `No beads on ${rigFilter}.`;
   const open = filtered.filter((b) => b.status === 'open').length;
   const inProgress = filtered.filter((b) => b.status === 'in_progress').length;
   const blocked = filtered.filter((b) => b.status === 'blocked').length;
@@ -492,6 +747,7 @@ function buildSynopsis(filtered: ReadonlyArray<GcBead>, totalShown: number, labe
   if (blocked > 0) parts.push(`${blocked} blocked`);
   if (parts.length === 0) return 'Nothing on the queue.';
   let s = parts.join(', ') + '.';
+  if (rigFilter.length > 0) s = `${rigFilter}: ${s}`;
   if (totalShown > filtered.length) s += ` Showing ${filtered.length} of ${totalShown}.`;
   return s;
 }

@@ -3,14 +3,27 @@ import { MemoryRouter } from 'react-router-dom';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { HealthPage } from './Health';
 import { invalidate } from '../api/cache';
+import { AttentionProvider } from '../attention/context';
+import {
+  createAttentionContributors,
+  type HealthAttentionFacts,
+} from '../attention/registry';
+import type { HealthOutputBody } from '../generated/gc-supervisor-client/types.gen';
 import type {
   DoltNomsTrend,
-  SupervisorHealth,
   SystemHealth,
 } from 'gas-city-dashboard-shared';
 
-// gascity-dashboard-e0hh: coverage for the absent
-// supervisor.city / supervisor.version paths in Health.tsx —
+const mockCityHealth = vi.fn<() => Promise<HealthOutputBody>>();
+
+vi.mock('../supervisor/client', () => ({
+  supervisorApi: () => ({
+    cityHealth: mockCityHealth,
+  }),
+}));
+
+// gascity-dashboard-e0hh: coverage for the absent supervisor.city /
+// supervisor.version paths in Health.tsx —
 // (a) the warn-toned <Kv> blocks render "not reported by supervisor",
 // (b) buildSynopsis omits the "on <city>" locator clause, asserted
 //     via rendered DOM rather than by exporting the module-private
@@ -21,11 +34,13 @@ let currentTrend: DoltNomsTrend = baseTrend();
 
 beforeEach(() => {
   invalidate('health');
+  mockCityHealth.mockReset();
+  mockCityHealth.mockResolvedValue(presentLocator());
   currentHealth = baseHealth();
   currentTrend = baseTrend();
   vi.stubGlobal('fetch', vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
-    if (url === '/api/city/test-city/health/system') {
+    if (url === '/api/health/system') {
       return jsonResponse(currentHealth);
     }
     if (url === '/api/city/test-city/dolt-noms/trend') {
@@ -42,7 +57,7 @@ afterEach(() => {
 
 describe('HealthPage', () => {
   it('renders warn-toned "not reported by supervisor" for absent city and version', async () => {
-    currentHealth = withSupervisor(absentLocator());
+    mockCityHealth.mockResolvedValue(absentLocator());
 
     const { container } = renderPage();
     await screen.findByRole('heading', { name: /^health$/i });
@@ -58,7 +73,7 @@ describe('HealthPage', () => {
   });
 
   it('omits the "on <city>" locator clause from the synopsis when city is absent', async () => {
-    currentHealth = withSupervisor(absentLocator());
+    mockCityHealth.mockResolvedValue(absentLocator());
 
     renderPage();
     // Wait for the data-dependent Supervisor section heading before
@@ -81,7 +96,7 @@ describe('HealthPage', () => {
     // Positive contrast for the absent-path tests — guards against a
     // false-positive where the warn tone or the dropped clause was
     // applied to every supervisor render path.
-    currentHealth = withSupervisor(presentLocator());
+    mockCityHealth.mockResolvedValue(presentLocator());
 
     const { container } = renderPage();
     // Same as the test above: wait for the Supervisor section heading
@@ -107,15 +122,71 @@ describe('HealthPage', () => {
     expect(synopsis).not.toBeNull();
     expect(synopsis?.textContent ?? '').toMatch(/Supervisor healthy on racoon-city, uptime /);
   });
+
+  it('uses the generated supervisor client for city health and not the dashboard city health mirror', async () => {
+    renderPage();
+
+    await screen.findByRole('heading', { name: /supervisor/i });
+
+    expect(mockCityHealth).toHaveBeenCalledWith('test-city');
+    expect(fetch).toHaveBeenCalledWith('/api/health/system', expect.any(Object));
+    expect(fetch).not.toHaveBeenCalledWith('/api/city/test-city/health/system', expect.any(Object));
+  });
+
+  it('keeps dashboard-local host health visible when direct supervisor health fails', async () => {
+    mockCityHealth.mockRejectedValue(new Error('supervisor unavailable'));
+
+    renderPage();
+
+    await screen.findByRole('heading', { name: /host/i });
+    expect(screen.getByText('Supervisor not reachable. The dashboard shell stays up; live data is stale.')).toBeTruthy();
+    expect(screen.getByText('8')).toBeTruthy();
+  });
+
+  it('highlights Health sections that match composed attention facts', async () => {
+    const supervisor = absentLocator();
+    mockCityHealth.mockResolvedValue(supervisor);
+    currentHealth = {
+      ...baseHealth(),
+      host: {
+        ...baseHealth().host,
+        free_mem_bytes: 400_000_000,
+      },
+    };
+    currentTrend = {
+      available: false,
+      reason: 'sample_failed',
+      samples: [],
+    };
+
+    renderPage({
+      attention: {
+        system: currentHealth,
+        supervisor: { status: 'available', data: supervisor },
+        trend: currentTrend,
+      },
+    });
+
+    await screen.findByRole('heading', { name: /dolt-noms/i });
+
+    expect(sectionFor('Supervisor')?.getAttribute('data-attention-severity')).toBe('watch');
+    expect(sectionFor('Host')?.getAttribute('data-attention-severity')).toBe('attention');
+    expect(sectionFor('Dolt-noms · 24 h')?.getAttribute('data-attention-severity')).toBe('watch');
+  });
 });
 
-function renderPage() {
+function renderPage({ attention }: { attention?: HealthAttentionFacts } = {}) {
+  const contributors = createAttentionContributors(
+    attention === undefined ? {} : { health: attention },
+  );
   return render(
     <MemoryRouter
       initialEntries={['/health']}
       future={{ v7_relativeSplatPath: true, v7_startTransition: true }}
     >
-      <HealthPage />
+      <AttentionProvider contributors={contributors}>
+        <HealthPage />
+      </AttentionProvider>
     </MemoryRouter>,
   );
 }
@@ -144,14 +215,11 @@ function synopsisFor(heading: HTMLElement): HTMLElement | null {
   return header?.querySelector('p') ?? null;
 }
 
-function withSupervisor(supervisor: SupervisorHealth): SystemHealth {
-  return {
-    ...baseHealth(),
-    supervisor: { status: 'available', data: supervisor },
-  };
+function sectionFor(heading: string): HTMLElement | null {
+  return screen.getByRole('heading', { name: heading }).closest('section');
 }
 
-function presentLocator(): SupervisorHealth {
+function presentLocator(): HealthOutputBody {
   return {
     status: 'ok',
     city: 'racoon-city',
@@ -160,7 +228,7 @@ function presentLocator(): SupervisorHealth {
   };
 }
 
-function absentLocator(): SupervisorHealth {
+function absentLocator(): HealthOutputBody {
   // The two fields under test are deliberately omitted, not set to
   // undefined or null — that mirrors what a wire-drifted supervisor
   // payload actually looks like over JSON.
@@ -187,10 +255,6 @@ function baseHealth(): SystemHealth {
       free_mem_bytes: 8_000_000_000,
       cpu_count: 8,
       uptime_sec: 86_400,
-    },
-    supervisor: {
-      status: 'available',
-      data: presentLocator(),
     },
   };
 }

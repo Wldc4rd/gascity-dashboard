@@ -3,8 +3,8 @@ import type {
   RunScopeKind,
 } from 'gas-city-dashboard-shared';
 import { errorMessage } from 'gas-city-dashboard-shared';
-import { api } from '../api/client';
 import { reportClientError } from '../lib/clientErrorReporting';
+import { loadSupervisorFormulaRunDetail } from '../supervisor/runDetail';
 import { useCachedData } from './useCachedData';
 
 interface FormulaRunDetailState {
@@ -72,7 +72,7 @@ async function loadFormulaRunDetail(
   const params: { scopeKind?: RunScopeKind; scopeRef?: string } = {};
   if (scopeKind !== undefined) params.scopeKind = scopeKind;
   if (scopeRef !== undefined) params.scopeRef = scopeRef;
-  const detail = await api.formulaRun(runId, params);
+  const detail = await loadSupervisorFormulaRunDetail(runId, params.scopeKind, params.scopeRef);
   return { kind: 'loaded', detail };
 }
 

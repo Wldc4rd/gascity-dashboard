@@ -3,18 +3,18 @@ import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
   EntityLinkView,
-  GcBead,
   GcSession,
 } from 'gas-city-dashboard-shared';
 import { NowProvider } from '../../contexts/NowContext';
+import type { SupervisorBead } from '../../supervisor/beadReads';
 import { BeadDetailRail } from './BeadDetailRail';
 
-// useBeadDetail and useEntityLinks both call the api client; mock it so the
-// rail renders without a backend. getBead is never hit when initialBead
-// carries a description (the freshness signal), but entityLinks always fires.
+// useBeadDetail and useEntityLinks both call network-backed helpers; mock them
+// so the rail renders without a backend. fetchSupervisorBead is never hit when
+// initialBead carries a description (the freshness signal), but entityLinks
+// always fires.
 vi.mock('../../api/client', () => ({
   api: {
-    getBead: vi.fn(),
     entityLinks: vi.fn(
       (ref: string): Promise<EntityLinkView> =>
         Promise.resolve({
@@ -31,15 +31,20 @@ vi.mock('../../api/client', () => ({
   ApiClientError: class extends Error {},
 }));
 
+const mockFetchSupervisorBead = vi.hoisted(() => vi.fn());
+
+vi.mock('../../supervisor/beadReads', () => ({
+  fetchSupervisorBead: mockFetchSupervisorBead,
+}));
+
 afterEach(() => cleanup());
 
-function bead(extra: Partial<GcBead> = {}): GcBead {
+function bead(extra: Partial<SupervisorBead> = {}): SupervisorBead {
   return {
     id: 'b1',
     title: 'judge live smoke',
     status: 'in_progress',
     issue_type: 'task',
-    priority: null,
     created_at: '2026-05-01T00:00:00Z',
     description: 'do the thing',
     ...extra,
@@ -91,6 +96,28 @@ describe('BeadDetailRail', () => {
     await waitFor(() =>
       expect(screen.getByText(/view live run/i)).toBeTruthy(),
     );
+  });
+
+  it('fetches bead detail from the supervisor API when the selected bead is outside the cached window', async () => {
+    mockFetchSupervisorBead.mockResolvedValue(bead({
+      id: 'td-outside-window',
+      title: 'fetched from supervisor',
+      description: 'loaded directly',
+    }));
+
+    renderRail(
+      <BeadDetailRail
+        beadId="td-outside-window"
+        initialBead={null}
+        sessions={[]}
+        onOpenBead={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(mockFetchSupervisorBead).toHaveBeenCalledWith('td-outside-window');
+    });
+    expect(await screen.findByText('fetched from supervisor')).toBeTruthy();
   });
 
   it('omits the live-run affordance when no session matches the assignee', async () => {

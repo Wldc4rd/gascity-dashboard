@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import type { GcAgent } from 'gas-city-dashboard-shared';
+import type { AgentResponse } from '../generated/gc-supervisor-client/types.gen';
 import { AGENT_CHIPS, buildAgentSynopsis, stateTone } from './Agents';
 
 // gascity-dashboard-ay6: the Agents view consumes the supervisor's
-// first-class agent roster (GcAgent), not the session list. These tests
+// first-class agent roster (AgentResponse), not the session list. These tests
 // pin the chip-coverage invariant on the agent shape: every state the
 // supervisor reports must match at least one chip, otherwise agents in
 // that state vanish silently when any chip is active (parallels the bug
@@ -21,7 +21,7 @@ const NAMED_STATES = [
   'closed',
 ] as const;
 
-function mkAgent(state: string, overrides: Partial<GcAgent> = {}): GcAgent {
+function mkAgent(state: string, overrides: Partial<AgentResponse> = {}): AgentResponse {
   return {
     name: `agent-${state}`,
     available: true,
@@ -108,7 +108,7 @@ describe('stateTone', () => {
 
 describe('buildAgentSynopsis', () => {
   it('reports detached agents as a distinct count, not bucketed under idle', () => {
-    const rows: GcAgent[] = [
+    const rows: AgentResponse[] = [
       mkAgent('active'),
       mkAgent('asleep'),
       mkAgent('asleep'),
@@ -121,12 +121,12 @@ describe('buildAgentSynopsis', () => {
   });
 
   it('omits detached from the synopsis when there are no detached agents', () => {
-    const rows: GcAgent[] = [mkAgent('active'), mkAgent('asleep')];
+    const rows: AgentResponse[] = [mkAgent('active'), mkAgent('asleep')];
     expect(buildAgentSynopsis(rows)).not.toContain('detached');
   });
 
   it('breaks suspended out as its own count', () => {
-    const rows: GcAgent[] = [
+    const rows: AgentResponse[] = [
       mkAgent('active'),
       mkAgent('asleep', { suspended: true }),
     ];

@@ -15,6 +15,8 @@ import { GcClient } from './gc-client.js';
 import { gitRouter } from './routes/git.js';
 import { buildsRouter } from './routes/builds.js';
 import { clientErrorsRouter } from './routes/client-errors.js';
+import { healthRouter } from './routes/health.js';
+import { supervisorTransportProxy } from './routes/supervisor-transport-proxy.js';
 import {
   createCityRegistry,
   supervisorCityLister,
@@ -27,7 +29,6 @@ import {
   logInfo,
   logWarn,
 } from './logging.js';
-import { routeUpstreamError, writeRouteError } from './route-errors.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -46,7 +47,6 @@ export interface DashboardApp {
 export function createDashboardApp(config: AdminConfig): DashboardApp {
   const app = express();
   app.disable('x-powered-by');
-  app.use(express.json({ limit: '64kb' }));
 
   app.use(hostHeaderAllowlistFactory(config.extraAllowedHosts));
   app.use(originCheck(config.port, config.extraAllowedHosts));
@@ -66,31 +66,17 @@ export function createDashboardApp(config: AdminConfig): DashboardApp {
     listCities: supervisorCityLister(supervisorGc),
   });
 
+  app.use('/gc-supervisor', supervisorTransportProxy(config.gcSupervisorUrl));
+  app.use(express.json({ limit: '64kb' }));
+
   // ── Top-level (non-city) routes ─────────────────────────────────────────
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true, ts: new Date().toISOString() });
   });
+  app.use('/api/health', healthRouter());
 
   app.get('/api/csrf', (_req, res) => {
     res.json({ token: getCsrfToken() });
-  });
-
-  // City switcher source. Wire-shape CityList (host path stripped by the
-  // decoder — it never reaches the browser).
-  app.get('/api/cities', async (_req, res) => {
-    try {
-      const cities = await supervisorGc.listCities();
-      res.json(cities);
-    } catch (err) {
-      const wire = routeUpstreamError(err, {
-        component: LOG_COMPONENT.admin,
-        operation: 'GET /api/cities',
-        responseError: 'gc supervisor city registry unreachable',
-        isTimeout: GcClient.isTimeoutError,
-        log: logWarn,
-      });
-      writeRouteError(res, wire);
-    }
   });
 
   // Host-global write routes (git/builds/client-errors) are NOT city-scoped:
