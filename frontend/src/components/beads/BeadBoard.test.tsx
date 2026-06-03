@@ -1,10 +1,20 @@
 import { cleanup, fireEvent, render, screen, within } from '@testing-library/react';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { BeadStatus } from 'gas-city-dashboard-shared';
 import type { SupervisorBead } from '../../supervisor/beadReads';
 import { buildBeadGraph } from '../../lib/beadGraph';
 import { assertAtMostOneMark } from '../../test/assertions/oneMarkRule';
 import { BeadBoard } from './BeadBoard';
+
+const scrollIntoView = vi.fn();
+
+beforeEach(() => {
+  scrollIntoView.mockClear();
+  Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', {
+    configurable: true,
+    value: scrollIntoView,
+  });
+});
 
 afterEach(() => cleanup());
 
@@ -62,6 +72,16 @@ describe('BeadBoard', () => {
     const { onSelect } = renderBoard([bead('A', 'open', { title: 'pick me' })]);
     fireEvent.click(screen.getByText('pick me'));
     expect(onSelect).toHaveBeenCalledWith('A');
+  });
+
+  it('scrolls the selected bead row into view on initial deep-link selection', () => {
+    renderBoard([bead('A', 'open', { title: 'deep linked bead' })], 'A');
+
+    expect(screen.getByTitle('Select A').getAttribute('aria-pressed')).toBe('true');
+    expect(scrollIntoView).toHaveBeenCalledWith({
+      block: 'center',
+      inline: 'nearest',
+    });
   });
 
   it('expands needs/blocks sub-rows for the selected bead and re-centres on click', () => {
